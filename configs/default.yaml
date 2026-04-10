@@ -1,0 +1,153 @@
+# ============================================================
+# Cluster-Based Optimal Data Selection for Continual Pre-training
+# All hyperparameters are configured here.
+# Override from CLI: python train.py --config configs/default.yaml training.lr=1e-5
+# Multi-GPU: torchrun --nproc_per_node=4 train.py --config configs/default.yaml
+# DeepSpeed ZeRO-3: deepspeed --num_gpus=4 train.py --config configs/default.yaml deepspeed.enabled=true
+# DeepSpeed ZeRO-3 + CPU offload: deepspeed --num_gpus=4 train.py --config configs/default.yaml deepspeed.enabled=true deepspeed.config_file=configs/ds_zero3_offload.json
+# ============================================================
+
+model:
+  path: "/apdcephfs_jn4/share_304380933/rongyiyu/code/qwen3-8B"                      # HuggingFace model name or local path (required)
+  type: "auto"                  # auto | mistral | llama | gpt2
+  max_length: 1024              # max token length per sample
+  dtype: "bfloat16"              # float16 | bfloat16 | float32
+  attn_impl: "sdpa"             # eager | sdpa | flash_attention_2
+  gradient_checkpointing: false # enable gradient checkpointing to save memory
+
+data:
+  train_dir: "/apdcephfs_jn4/share_304380933/rongyiyu/code/cluster_data_selection/dataset-100k"                 # folder containing *.json / *.jsonl training files (required)
+  dev_dir: "/apdcephfs_jn4/share_304380933/rongyiyu/code/cluster_data_selection/valid"   # MMLU validation set (1531 samples)
+  text_field: "text"            # key name in each JSON record to use as text
+  dev_num: 300                   # max number of dev samples for PMP backward gradient
+  num_workers: 2                # DataLoader workers
+  eval_format: "fewshot"        # fewshot | text  (fewshot = MCQ accuracy; text = LM loss)
+  n_shot: 3                     # number of few-shot demonstrations (0 = zero-shot)
+  # Multi-domain validation sets (optional).
+  # If set, dev_dir is ignored and each domain is loaded independently.
+  # Weights are unnormalised — only their relative ratios matter.
+  # Domains can be added/removed at runtime via trainer.dev_domain_manager.
+  dev_domains: []
+  # Example (uncomment to use):
+  # dev_domains:
+  #   - name: "math"
+  #     dir: "data/dev/math"
+  #     weight: 0.5
+  #   - name: "code"
+  #     dir: "data/dev/code"
+  #     weight: 0.3
+  #   - name: "general"
+  #     dir: "data/dev/general"
+  #     weight: 0.2
+
+clustering:
+  method: "minibatch"             # minibatch | kmeans | faiss | random
+                                  #   minibatch: sklearn MiniBatchKMeans (fast, default)
+                                  #   kmeans:    sklearn full KMeans (more accurate, slower)
+                                  #   faiss:     Faiss GPU KMeans (fastest for large datasets)
+                                  #   random:    random assignment (baseline)
+  cluster_size: 100             # target number of samples per cluster
+                                # n_clusters = max(1, N // cluster_size)
+  recluster_interval: -1        # re-run clustering every N steps (-1 = once at start)
+  kmeans:
+    n_init: 5                   # number of KMeans initializations
+    max_iter: 300               # max KMeans iterations
+    feature: "intermediate"     # projection | embedding | ghost | intermediate
+                                #   projection:    project per-sample LM gradients to proj_dim
+                                #   embedding:     mean of last hidden states (slow, keeps all layers)
+                                #   ghost:         project with selective parameter masking
+                                #   intermediate:  early-exit at a specific layer (fast, recommended)
+    embed_layer: -1             # layer index for intermediate mode (-1 = middle layer)
+                                # e.g. Qwen3-8B has 32 layers, -1 → layer 16
+                                # set 0..N-1 for a specific layer
+    feature_batch_size: 64      # batch size when extracting features for KMeans
+  embedding_model:              # Optional separate small model for clustering feature extraction
+    enabled: true               # if true, use a lightweight model for embeddings (much faster)
+    path: "/apdcephfs_jn4/share_304380933/rongyiyu/code/qwen2.5-0.5B"
+    dtype: "bfloat16"
+    attn_impl: "sdpa"
+  ghost:                        # Ghost projection settings (only used if feature: "ghost")
+    enabled: true               # enable ghost projection for clustering
+    strategy: "layerwise"       # layerwise | random | frequency
+                                #   layerwise:  mask entire layers (requires layer_indices or num_layers)
+                                #   random:     randomly mask a fraction of parameters
+                                #   frequency:  mask parameters by update frequency (self-adaptive)
+    fraction: 0.5               # for random/frequency: fraction of params to KEEP (1.0 - mask_ratio)
+    layer_indices: []           # for layerwise: list of layer indices to KEEP (e.g., [0, 2, 4])
+    num_layers: null            # for layerwise: total number of layers in model (auto-computed if null)
+
+projection:
+  enabled: true                 # whether to apply random projection
+  dim: 1024                     # output dimension after projection (0 = full param dim)
+  type: "rademacher"            # rademacher | gaussian | identity
+  seed: 42                      # random seed for reproducible projection matrix
+
+pmp:
+  window_size: 20               # number of recent training steps kept in ring buffer
+  update_interval: 100          # update cluster weights every N gradient steps
+  lr: 0.008                     # lr factor used inside PMP backward (typically = training lr or SGD lr)
+  temperature: 1.0              # softmax temperature when converting grad_gamma → weights
+                                # higher = more uniform weights
+  min_weight: 0.01              # minimum weight floor per cluster (prevents starvation)
+  accumulate_grad_gamma: true   # if true, accumulate grad_gamma across PMP updates
+                                # if false, reset grad_gamma each PMP update window
+  drop_bad_clusters: true       # if true, permanently drop clusters with consecutive negative ct_k
+  drop_patience: 5              # consecutive negative PMP updates before dropping a cluster
+  jvp_chunk_size: null          # chunk size for vmap jvp; null = full batch (reduce if OOM)
+  dev_batch_size: 4             # batch size when computing dev gradient during PMP backward
+  ghost:                        # Ghost projection settings for PMP (optional methods 2 & 3)
+    enabled_in_lambda: false    # Method 2: apply ghost when computing dev gradient (∇L_dev)
+    enabled_in_weights: false   # Method 3: apply ghost when updating weights (grad_gamma → w)
+    strategy: "random"          # Ghost strategy for PMP phases
+    fraction: 0.5               # fraction of parameters to keep
+  ghost_ip:                     # Ghost Inner Product fast path (replaces ring-buffer JVP)
+    enabled: true               # set true to skip ring-buffer traversal entirely
+                                # uses ghost inner product for O(1) per-step update
+    proj_dim: 8192              # sketch/projection dimension (higher = more accurate)
+    proj_type: "count_sketch"   # count_sketch | rademacher | gaussian
+                                #   count_sketch: hash-based sketch (~60MB vs 16GB matrix)
+                                #   rademacher:   explicit random matrix (legacy, high memory)
+                                #   gaussian:     explicit random matrix (legacy, high memory)
+    seed: 42                    # random seed for sketch hash/sign tables
+    strategy: "random"          # random | layerwise | frequency (only for rademacher/gaussian)
+    fraction: 0.5               # fraction of parameters to keep in mask (only for rademacher/gaussian)
+
+training:
+  total_iters: 10000            # total gradient update steps
+  batch_size: 6                 # per-GPU micro-batch size
+  gradient_accumulation_steps: 2
+  eval_batch_size: 16
+  lr: 3.0e-5
+  lr_min: 3.0e-6                # minimum lr for cosine schedule
+  optimizer: "adamw"            # sgd | adam | adamw
+  scheduler: "cosine"           # constant | cosine | noam
+  warmup_iters: 200
+  weight_decay: 0.01
+  clip_grad: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_eps: 1.0e-6
+  seed: 42
+  log_interval: 10              # log every N gradient steps
+  eval_interval: 500            # evaluate on dev set every N gradient steps
+  save_interval: 1000           # save checkpoint every N gradient steps
+  save_dir: "outputs/run"       # output directory (checkpoints + logs)
+  no_eval_at_start: false       # skip evaluation before training starts
+  fp32: false                   # force full fp32 training (overrides model.dtype)
+
+# Proxy section (optional): if proxy_dir is set, PMP JVP contributions are
+# computed on proxy data rather than the training batch in the ring buffer.
+# Leave empty to use ring-buffer training data directly (recommended default).
+proxy:
+  proxy_dir: ""                 # optional path to a separate proxy JSON folder
+  proxy_num: -1                 # max proxy samples (-1 = all)
+  proxy_batch_size: 8           # batch size when iterating proxy data
+
+# DeepSpeed configuration (optional).
+# Enable to use DeepSpeed ZeRO-3 instead of PyTorch DDP.
+# Launch with: deepspeed --num_gpus=N train.py --config configs/default.yaml deepspeed.enabled=true
+deepspeed:
+  enabled: true                 # set true to use DeepSpeed instead of DDP
+  config_file: "configs/ds_zero3.json"  # path to DeepSpeed JSON config
+                                # ds_zero3.json          = ZeRO-3 (GPU only)
+                                # ds_zero3_offload.json  = ZeRO-3 + CPU offload (saves more memory)

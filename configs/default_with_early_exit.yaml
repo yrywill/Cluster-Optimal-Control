@@ -1,0 +1,112 @@
+# ============================================================
+# Cluster-Based Optimal Data Selection for Continual Pre-training
+# Extended with Early-Exit Clustering Support
+# ============================================================
+
+model:
+  path: "/apdcephfs_jn4/share_304380933/rongyiyu/code/qwen3-8B"
+  type: "auto"                  # auto | mistral | llama | gpt2
+  max_length: 2048              # max token length per sample
+  dtype: "bfloat16"              # float16 | bfloat16 | float32
+  attn_impl: "sdpa"             # eager | sdpa | flash_attention_2
+  gradient_checkpointing: false # enable gradient checkpointing to save memory
+
+data:
+  train_dir: "/apdcephfs_jn4/share_304380933/rongyiyu/code/cluster_data_selection/dataset-100k"
+  dev_dir: "/apdcephfs_jn4/share_304380933/rongyiyu/code/cluster_data_selection/valid"
+  text_field: "text"            # key name in each JSON record to use as text
+  dev_num: 500                  # max number of dev samples for PMP backward gradient
+  num_workers: 2                # DataLoader workers
+  eval_format: "fewshot"        # fewshot | text
+  n_shot: 3                     # number of few-shot demonstrations
+  dev_domains: []
+
+clustering:
+  method: "minibatch"             # minibatch | kmeans | faiss | random
+  cluster_size: 100             # target number of samples per cluster
+  recluster_interval: -1        # re-run clustering every N steps (-1 = once at start)
+  kmeans:
+    n_init: 5                   # number of KMeans initializations
+    max_iter: 300               # max KMeans iterations
+    feature: "ghost"       # projection | embedding | ghost | intermediate
+                                #   projection: project per-sample LM gradients to proj_dim
+                                #   embedding:  mean of last hidden states (no gradient)
+                                #   ghost:      project with selective parameter masking
+                                #   intermediate: extract from middle layer (early-exit)
+    feature_batch_size: 64      # batch size when extracting features for KMeans
+    feature_layer: -1           # NEW: which layer to extract from for intermediate mode
+                                #   -1 = final layer (default)
+                                #   0-35 = specific layer for Qwen3-8B (36 layers total)
+    use_early_exit: false       # NEW: enable early-exit feature extraction
+  ghost:                        # Ghost projection settings (only used if feature: "ghost")
+    enabled: true               # enable ghost projection for clustering
+    strategy: "layerwise"       # layerwise | random | frequency
+    fraction: 0.5               # for random/frequency: fraction of params to KEEP
+    layer_indices: []           # for layerwise: list of layer indices to KEEP
+    num_layers: null            # for layerwise: total number of layers in model
+  early_exit:                   # NEW: Early-exit specific settings
+    enabled: false              # enable early-exit clustering mode
+    layer_idx: 18               # middle of 36-layer model (0-35 for Qwen3-8B)
+                                # used when use_early_exit=true or feature="intermediate"
+
+projection:
+  enabled: true                 # whether to apply random projection
+  dim: 1024                     # output dimension after projection (0 = full param dim)
+  type: "rademacher"            # rademacher | gaussian | identity
+  seed: 42                      # random seed for reproducible projection matrix
+
+pmp:
+  window_size: 20               # number of recent training steps kept in ring buffer
+  update_interval: 100          # update cluster weights every N gradient steps
+  lr: 0.008                     # lr factor used inside PMP backward
+  temperature: 1.0              # softmax temperature
+  min_weight: 0.01              # minimum weight floor per cluster
+  accumulate_grad_gamma: true   # if true, accumulate grad_gamma across PMP updates
+  jvp_chunk_size: null          # chunk size for vmap jvp; null = full batch (reduce if OOM)
+  dev_batch_size: 16            # batch size when computing dev gradient during PMP backward
+  ghost:                        # Ghost projection settings for PMP
+    enabled_in_lambda: false    # Method 2: apply ghost when computing dev gradient
+    enabled_in_weights: false   # Method 3: apply ghost when updating weights
+    strategy: "random"          # Ghost strategy for PMP phases
+    fraction: 0.5               # fraction of parameters to keep
+  ghost_ip:                     # Ghost Inner Product fast path
+    enabled: true               # set true to skip ring-buffer traversal entirely
+    proj_dim: 1024              # projection dimension for ghost IP
+    proj_type: "rademacher"     # rademacher | gaussian
+    strategy: "random"          # random | layerwise | frequency
+    fraction: 0.5               # fraction of parameters to keep in mask
+  early_exit:                   # NEW: Early-exit specific settings for PMP
+    enabled: false              # enable early-exit in PMP backward
+    layer_idx: 18               # which layer to use for PMP dev gradient
+
+training:
+  total_iters: 10000            # total gradient update steps
+  batch_size: 8                 # per-GPU micro-batch size
+  gradient_accumulation_steps: 1
+  eval_batch_size: 16
+  lr: 3.0e-5
+  lr_min: 3.0e-6                # minimum lr for cosine schedule
+  optimizer: "adamw"            # sgd | adam | adamw
+  scheduler: "cosine"           # constant | cosine | noam
+  warmup_iters: 200
+  weight_decay: 0.01
+  clip_grad: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_eps: 1.0e-6
+  seed: 42
+  log_interval: 10              # log every N gradient steps
+  eval_interval: 500            # evaluate on dev set every N gradient steps
+  save_interval: 1000           # save checkpoint every N gradient steps
+  save_dir: "outputs/run"       # output directory (checkpoints + logs)
+  no_eval_at_start: false       # skip evaluation before training starts
+  fp32: false                   # force full fp32 training (overrides model.dtype)
+
+proxy:
+  proxy_dir: ""                 # optional path to a separate proxy JSON folder
+  proxy_num: -1                 # max proxy samples (-1 = all)
+  proxy_batch_size: 8           # batch size when iterating proxy data
+
+deepspeed:
+  enabled: true                 # set true to use DeepSpeed instead of DDP
+  config_file: "configs/ds_zero3.json"
