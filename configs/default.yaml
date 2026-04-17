@@ -8,18 +8,18 @@
 # ============================================================
 
 model:
-  path: "/apdcephfs_jn4/share_304380933/rongyiyu/code/qwen3-8B"                      # HuggingFace model name or local path (required)
+  path: "/apdcephfs_jn4/share_304380933/rongyiyu/code/llama-3.2-3B"                      # HuggingFace model name or local path (required)
   type: "auto"                  # auto | mistral | llama | gpt2
   max_length: 1024              # max token length per sample
   dtype: "bfloat16"              # float16 | bfloat16 | float32
-  attn_impl: "sdpa"             # eager | sdpa | flash_attention_2
-  gradient_checkpointing: false # enable gradient checkpointing to save memory
+  attn_impl: "flash_attention_2" # eager | sdpa | flash_attention_2
+  gradient_checkpointing: true  # enable gradient checkpointing to save memory
 
 data:
   train_dir: "/apdcephfs_jn4/share_304380933/rongyiyu/code/cluster_data_selection/dataset-100k"                 # folder containing *.json / *.jsonl training files (required)
   dev_dir: "/apdcephfs_jn4/share_304380933/rongyiyu/code/cluster_data_selection/valid"   # MMLU validation set (1531 samples)
   text_field: "text"            # key name in each JSON record to use as text
-  dev_num: 300                   # max number of dev samples for PMP backward gradient
+  dev_num: 100                   # max number of dev samples for PMP backward gradient
   num_workers: 2                # DataLoader workers
   eval_format: "fewshot"        # fewshot | text  (fewshot = MCQ accuracy; text = LM loss)
   n_shot: 3                     # number of few-shot demonstrations (0 = zero-shot)
@@ -46,7 +46,7 @@ clustering:
                                   #   kmeans:    sklearn full KMeans (more accurate, slower)
                                   #   faiss:     Faiss GPU KMeans (fastest for large datasets)
                                   #   random:    random assignment (baseline)
-  cluster_size: 100             # target number of samples per cluster
+  cluster_size: 500             # target number of samples per cluster
                                 # n_clusters = max(1, N // cluster_size)
   recluster_interval: -1        # re-run clustering every N steps (-1 = once at start)
   kmeans:
@@ -60,7 +60,7 @@ clustering:
     embed_layer: -1             # layer index for intermediate mode (-1 = middle layer)
                                 # e.g. Qwen3-8B has 32 layers, -1 → layer 16
                                 # set 0..N-1 for a specific layer
-    feature_batch_size: 64      # batch size when extracting features for KMeans
+    feature_batch_size: 256     # batch size when extracting features for KMeans (GPU free during clustering)
   embedding_model:              # Optional separate small model for clustering feature extraction
     enabled: true               # if true, use a lightweight model for embeddings (much faster)
     path: "/apdcephfs_jn4/share_304380933/rongyiyu/code/qwen2.5-0.5B"
@@ -84,10 +84,10 @@ projection:
 
 pmp:
   window_size: 20               # number of recent training steps kept in ring buffer
-  update_interval: 100          # update cluster weights every N gradient steps
-  lr: 0.008                     # lr factor used inside PMP backward (typically = training lr or SGD lr)
-  temperature: 1.0              # softmax temperature when converting grad_gamma → weights
-                                # higher = more uniform weights
+  update_interval: 20           # update cluster weights every N gradient steps
+  lr: 1.0                      # lr factor used inside PMP backward
+  temperature: 0.1              # softmax temperature when converting grad_gamma → weights
+                                # lower = more concentrated on high-scoring clusters
   min_weight: 0.01              # minimum weight floor per cluster (prevents starvation)
   accumulate_grad_gamma: true   # if true, accumulate grad_gamma across PMP updates
                                 # if false, reset grad_gamma each PMP update window
@@ -113,8 +113,8 @@ pmp:
     fraction: 0.5               # fraction of parameters to keep in mask (only for rademacher/gaussian)
 
 training:
-  total_iters: 10000            # total gradient update steps
-  batch_size: 6                 # per-GPU micro-batch size
+  total_iters: 500              # total gradient update steps (quick validation)
+  batch_size: 4                 # per-GPU micro-batch size
   gradient_accumulation_steps: 2
   eval_batch_size: 16
   lr: 3.0e-5
@@ -147,7 +147,5 @@ proxy:
 # Enable to use DeepSpeed ZeRO-3 instead of PyTorch DDP.
 # Launch with: deepspeed --num_gpus=N train.py --config configs/default.yaml deepspeed.enabled=true
 deepspeed:
-  enabled: true                 # set true to use DeepSpeed instead of DDP
-  config_file: "configs/ds_zero3.json"  # path to DeepSpeed JSON config
-                                # ds_zero3.json          = ZeRO-3 (GPU only)
-                                # ds_zero3_offload.json  = ZeRO-3 + CPU offload (saves more memory)
+  enabled: false                # set true to use DeepSpeed instead of DDP
+  config_file: "configs/ds_zero1.json"

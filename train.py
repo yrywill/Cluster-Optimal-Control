@@ -19,6 +19,7 @@ CLI overrides use OmegaConf dot-list syntax (key=value pairs appended after --co
 from __future__ import annotations
 
 import argparse
+import datetime
 import logging
 import os
 import sys
@@ -66,7 +67,8 @@ def _init_distributed(use_deepspeed: bool = False) -> tuple[int, int]:
         # Not distributed
         return 0, 1
 
-    dist.init_process_group(backend="nccl", init_method="env://")
+    dist.init_process_group(backend="nccl", init_method="env://",
+                            timeout=datetime.timedelta(minutes=60))
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     torch.cuda.set_device(local_rank)

@@ -1,7 +1,7 @@
-# Large datasets
+# Large datasets / eval data
 dataset-100k/
 outputs/
-data/
+valid/
 
 # Python
 __pycache__/

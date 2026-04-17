@@ -59,11 +59,10 @@ class CountSketchProjector:
         """
         Lazily build and cache hash/sign tensors for a named parameter.
 
-        We key by parameter *name* (not shape) so that two parameters with the
-        same shape but different roles get independent random mappings, avoiding
-        hash collisions that would increase variance.
+        Hash/sign are cached on CPU to avoid GPU memory buildup (38GB+ for 3B model).
+        They are moved to GPU on-the-fly during scatter_add, then discarded from GPU.
         """
-        cache_key = (name, str(device))
+        cache_key = name  # CPU-only cache, no device in key
         if cache_key not in self._cache:
             # Deterministic seed per parameter name
             name_hash = hash(name) & 0xFFFFFFFF
@@ -72,11 +71,11 @@ class CountSketchProjector:
             h = torch.randint(0, self.m, (numel,), generator=g, dtype=torch.int64)
             sign = torch.randint(0, 2, (numel,), generator=g, dtype=torch.float32) * 2 - 1
 
-            h = h.to(device)
-            sign = sign.to(device)
+            # Keep on CPU — moved to GPU on demand in sketch calls
             self._cache[cache_key] = (h, sign)
 
-        return self._cache[cache_key]
+        h_cpu, sign_cpu = self._cache[cache_key]
+        return h_cpu.to(device, non_blocking=True), sign_cpu.to(device, non_blocking=True)
 
     # ------------------------------------------------------------------
     # Core API

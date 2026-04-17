@@ -286,14 +286,58 @@ class IntegratedClusterTrainer:
 
         self._setup_seed()
 
-        # ---- Tokenizer ----
+        # ---- Clustering FIRST (before loading training model) ----
+        # Clustering uses a separate small model (Qwen2.5-0.5B) with its own tokenizer.
+        # Run while GPU is empty, then release the small model.
+        _print_rank0(f"Running {cfg.clustering.method} clustering ...", self.rank)
+        cluster_ids = self._run_clustering(cfg)
+        n_samples = len(cluster_ids)
+        _print_rank0(f"Clustering done: {len(set(cluster_ids))} clusters from {n_samples} samples", self.rank)
+
+        # ---- Save ALL clusters to JSON for inspection (rank 0 only) ----
+        if self.rank == 0:
+            from data.json_dataset import load_texts_from_dir
+            from collections import defaultdict
+            raw_texts = load_texts_from_dir(cfg.data.train_dir, cfg.data.text_field)
+            cluster_groups = defaultdict(list)
+            for idx, cid in enumerate(cluster_ids):
+                cluster_groups[int(cid)].append(idx)
+            # Sort clusters by size (largest first)
+            sorted_clusters = sorted(cluster_groups.items(), key=lambda x: -len(x[1]))
+            all_clusters = {}
+            for cid, indices in sorted_clusters:
+                samples = []
+                for i in indices[:3]:  # 每个cluster展示前3条
+                    text = raw_texts[i] if i < len(raw_texts) else "[index out of range]"
+                    samples.append({"index": i, "text": text[:300]})  # 截断300字符
+                all_clusters[f"cluster_{cid}"] = {
+                    "size": len(indices),
+                    "samples": samples,
+                }
+            # Save full cluster info
+            save_path = os.path.join(cfg.training.save_dir, "cluster_all.json")
+            os.makedirs(cfg.training.save_dir, exist_ok=True)
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(all_clusters, f, ensure_ascii=False, indent=2)
+            _print_rank0(f"All {len(sorted_clusters)} clusters saved to {save_path}", self.rank)
+            # Save summary stats
+            sizes = [len(indices) for _, indices in sorted_clusters]
+            _print_rank0(
+                f"Cluster stats: total={len(sorted_clusters)}, "
+                f"max_size={max(sizes)}, min_size={min(sizes)}, "
+                f"avg_size={sum(sizes)/len(sizes):.1f}, "
+                f"median={sorted(sizes)[len(sizes)//2]}",
+                self.rank,
+            )
+            del raw_texts
+
+        # ---- Training model tokenizer + model (after clustering frees GPU) ----
         self.tokenizer = AutoTokenizer.from_pretrained(
             cfg.model.path, use_fast=True, trust_remote_code=True
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # ---- Model ----
         _print_rank0(f"Loading model from {cfg.model.path} ...", self.rank)
         self.model = AutoModelForCausalLM.from_pretrained(
             cfg.model.path,
@@ -309,10 +353,12 @@ class IntegratedClusterTrainer:
         if self.use_deepspeed:
             self.model, self.optimizer, _, self.lr_scheduler = self._init_deepspeed(cfg)
             self._raw_model = self.model.module
-            _print_rank0("[DeepSpeed] Engine initialized with ZeRO-3", self.rank)
+            if cfg.model.gradient_checkpointing:
+                self._raw_model.gradient_checkpointing_enable()
+                _print_rank0("[DeepSpeed] Gradient checkpointing re-enabled on inner model", self.rank)
+            _print_rank0("[DeepSpeed] Engine initialized", self.rank)
         else:
             self.model = self.model.to(self.device)
-            # ---- Distributed (DDP) ----
             if _is_distributed():
                 self.model = torch.nn.parallel.DistributedDataParallel(
                     self.model,
@@ -328,7 +374,7 @@ class IntegratedClusterTrainer:
         # ---- TransformerWrapper for PMP (always uses raw model, single GPU) ----
         self.model_wrapper = TransformerWrapper(self._raw_model)
 
-        # ---- Datasets ----
+        # ---- Training data tokenization (with training model's tokenizer) ----
         _print_rank0("Loading training data ...", self.rank)
         self.train_base_dataset = JsonFolderDataset(
             data_dir=cfg.data.train_dir,
@@ -339,10 +385,11 @@ class IntegratedClusterTrainer:
         )
         _print_rank0(f"Train dataset: {len(self.train_base_dataset)} samples", self.rank)
 
+        self.train_dataset = ClusterDataset(self.train_base_dataset, cluster_ids)
+        self.n_clusters = self.train_dataset.n_clusters
+
+        # ---- Dev data ----
         _print_rank0("Loading dev data ...", self.rank)
-        # ----- Multi-domain dev set (optional) -----
-        # If cfg.data.dev_domains is set, load each domain separately with its weight.
-        # Otherwise fall back to the legacy single cfg.data.dev_dir path.
         self.dev_domain_manager = DevDomainManager()
 
         dev_domains_cfg = getattr(cfg.data, "dev_domains", None)
@@ -412,14 +459,6 @@ class IntegratedClusterTrainer:
                 f"Few-shot eval dataset: {len(self.fewshot_eval_dataset)} samples",
                 self.rank,
             )
-
-        # ---- Clustering ----
-        _print_rank0(f"Running {cfg.clustering.method} clustering ...", self.rank)
-        cluster_ids = self._run_clustering(cfg)
-
-        self.train_dataset = ClusterDataset(self.train_base_dataset, cluster_ids)
-        self.n_clusters = self.train_dataset.n_clusters
-        _print_rank0(f"Clustering done: {self.n_clusters} clusters", self.rank)
 
         # ---- Sampler + DataLoader ----
         self.sampler = ClusterWeightedSampler(
@@ -525,7 +564,9 @@ class IntegratedClusterTrainer:
 
         # ---- Logging setup ----
         os.makedirs(cfg.training.save_dir, exist_ok=True)
-        self.log_file = os.path.join(cfg.training.save_dir, "train.log")
+        from datetime import datetime
+        log_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = os.path.join(cfg.training.save_dir, f"{log_timestamp}.log")
         if self.rank == 0:
             _save_rank0(f"Config:\n{OmegaConf.to_yaml(cfg)}", self.log_file)
 
@@ -877,43 +918,32 @@ class IntegratedClusterTrainer:
 
         # Free training activations/gradients before PMP forward passes.
         # This is critical when GPU memory is near-full (~97GB/98GB).
-        self.model.zero_grad(set_to_none=True)  # release .grad tensors entirely
+        self.model.zero_grad()
         torch.cuda.empty_cache()
 
         # ==============================================================
-        # CountSketch fast path — no GatheredParameters needed!
+        # CountSketch fast path
         # ==============================================================
         if self.count_sketch_projector is not None:
             from pmp.grad_utils_sketch import compute_cluster_contributions_sketch
 
-            latest = self.ring_buffer.get_latest()
-            if latest is None:
-                _print_rank0("[PMP] CountSketch: ring buffer empty, skipping.", self.rank)
-                return
-
-            _, batch_cpu_latest, cluster_ids_latest = latest
-
-            # Move ALL domain dev batches to device once
+            # Move ALL domain dev batches to device
             domain_batches_device = self.dev_domain_manager.get_domain_batches_on_device(device)
             flat_dev_batches = [
                 b for _, _, blist in domain_batches_device for b in blist
             ]
 
-            batch_device = _batch_to_device(batch_cpu_latest, device)
-            cluster_ids_device = cluster_ids_latest.to(device)
-
-            # CountSketch works directly on the DeepSpeed model —
-            # each rank sketches its shard's .grad, then all_reduce(SUM).
+            # Evaluate ALL clusters (each with random 10 samples from train_dataset)
             grad_gamma_delta = compute_cluster_contributions_sketch(
-                model=self.model,
+                model=self._raw_model,
                 dev_batches=flat_dev_batches,
-                batch=batch_device,
-                batch_cluster_ids=cluster_ids_device,
                 n_clusters=self.n_clusters,
                 pmp_lr=cfg.pmp.lr,
                 sketcher=self.count_sketch_projector,
-                world_size=ws,
-                distributed=distributed,
+                train_dataset=self.train_dataset,
+                n_samples_per_cluster=10,
+                world_size=1,
+                distributed=False,  # DDP: each rank has full params, no need to all_reduce sketch
             )
 
             _print_rank0(
@@ -1084,6 +1114,14 @@ class IntegratedClusterTrainer:
                 self.grad_gamma,
                 os.path.join(self.cfg.training.save_dir, f"grad_gamma_{global_step}.pt"),
             )
+
+        # Sync all ranks before resuming DDP training
+        # PMP uses _raw_model (bypasses DDP), so we must barrier here.
+        if _is_distributed():
+            dist.barrier()
+        # Ensure model is back in train mode
+        self.model.train()
+        self.model.zero_grad()
 
     # ------------------------------------------------------------------
     # Clustering (shared by __init__ and _recluster)
