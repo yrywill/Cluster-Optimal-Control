@@ -329,6 +329,19 @@ class IntegratedClusterTrainer:
                 f"median={sorted(sizes)[len(sizes)//2]}",
                 self.rank,
             )
+
+            # ---- Save full sample_id → cluster_id mapping for later analysis ----
+            # Two files are written:
+            #   1. cluster_assignments.json  : human-readable, keeps cluster → [sample_ids]
+            #      and sample_id → cluster_id  (sample_id = stable dataset index).
+            #   2. cluster_ids.npy           : compact numpy array [N] aligned with
+            #      the training dataset order (fast to reload for analysis).
+            self._save_cluster_assignments(
+                cluster_ids=cluster_ids,
+                step=0,
+                tag="initial",
+            )
+
             del raw_texts
 
         # ---- Training model tokenizer + model (after clustering frees GPU) ----
@@ -834,9 +847,12 @@ class IntegratedClusterTrainer:
                 pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr_now:.2e}")
 
             # ---- PMP Backward: update cluster weights ----
+            # Note: ghost_ip fast path only needs the most recent ring-buffer entry
+            # (get_latest), so > 0 is sufficient. The legacy standard path
+            # still checks T < 2 internally and returns early if needed.
             if (
                 global_step % cfg.pmp.update_interval == 0
-                and len(self.ring_buffer) > 1
+                and len(self.ring_buffer) > 0
             ):
                 self._run_pmp_backward_and_update(global_step)
 
@@ -933,7 +949,9 @@ class IntegratedClusterTrainer:
                 b for _, _, blist in domain_batches_device for b in blist
             ]
 
-            # Evaluate ALL clusters (each with random 10 samples from train_dataset)
+            # Evaluate ALL clusters (each with random 4 samples from train_dataset)
+            # Cluster loop is rank-sharded: each rank owns clusters[rank::world_size],
+            # final all_reduce(SUM) combines contributions. ~world_size× speedup.
             grad_gamma_delta = compute_cluster_contributions_sketch(
                 model=self._raw_model,
                 dev_batches=flat_dev_batches,
@@ -941,9 +959,9 @@ class IntegratedClusterTrainer:
                 pmp_lr=cfg.pmp.lr,
                 sketcher=self.count_sketch_projector,
                 train_dataset=self.train_dataset,
-                n_samples_per_cluster=10,
-                world_size=1,
-                distributed=False,  # DDP: each rank has full params, no need to all_reduce sketch
+                n_samples_per_cluster=4,
+                world_size=ws,
+                distributed=distributed,
             )
 
             _print_rank0(
@@ -1092,6 +1110,16 @@ class IntegratedClusterTrainer:
 
         self.sampler.update_weights(self.grad_gamma.cpu(), grad_gamma_delta.cpu())
 
+        # ---- Append per-cluster weight history to cluster_weight_history.jsonl ----
+        # One JSON line per PMP update so later analysis can reconstruct the full
+        # trajectory w_k(t) for every cluster k.
+        self._log_cluster_weights(
+            global_step=global_step,
+            grad_gamma=self.grad_gamma,
+            grad_gamma_delta=grad_gamma_delta,
+            event="pmp_update",
+        )
+
         # Logging
         gg = self.grad_gamma
         _print_rank0(
@@ -1122,6 +1150,149 @@ class IntegratedClusterTrainer:
         # Ensure model is back in train mode
         self.model.train()
         self.model.zero_grad()
+
+    # ------------------------------------------------------------------
+    # Cluster analysis artefacts (JSON logs for offline analysis)
+    # ------------------------------------------------------------------
+
+    def _save_cluster_assignments(
+        self,
+        cluster_ids: np.ndarray,
+        step: int,
+        tag: str = "initial",
+    ):
+        """
+        Persist the sample_id → cluster_id mapping so the effect of clustering
+        and (later) of cluster weights can be analysed offline.
+
+        Outputs (all under cfg.training.save_dir):
+          - cluster_ids_{tag}.npy
+                compact int32 array aligned with the training dataset order.
+          - cluster_assignments_{tag}.json
+                {
+                  "step": <int>,
+                  "tag":  <str>,
+                  "n_samples":  N,
+                  "n_clusters": K,
+                  "cluster_sizes": {cluster_id: size, ...},
+                  "sample_to_cluster": {sample_id: cluster_id, ...},
+                  "cluster_to_samples": {cluster_id: [sample_id, ...], ...}
+                }
+          - cluster_assignments_latest.json   (symlink-style convenience copy)
+        """
+        if self.rank != 0:
+            return
+
+        save_dir = self.cfg.training.save_dir
+        os.makedirs(save_dir, exist_ok=True)
+
+        cluster_ids = np.asarray(cluster_ids, dtype=np.int32)
+        np.save(os.path.join(save_dir, f"cluster_ids_{tag}.npy"), cluster_ids)
+
+        # Build dictionaries. Cluster ids are ints; sample ids are dataset indices
+        # into self.train_base_dataset (stable across the life of this run).
+        cluster_to_samples: Dict[int, List[int]] = {}
+        for sample_id, cid in enumerate(cluster_ids.tolist()):
+            cluster_to_samples.setdefault(int(cid), []).append(int(sample_id))
+
+        cluster_sizes = {cid: len(v) for cid, v in cluster_to_samples.items()}
+        # sample_to_cluster may be large for huge datasets — keep it but JSON is
+        # still O(N) text which is fine for ~100k-scale training sets.
+        sample_to_cluster = {int(i): int(c) for i, c in enumerate(cluster_ids.tolist())}
+
+        payload = {
+            "step": int(step),
+            "tag": tag,
+            "n_samples": int(cluster_ids.shape[0]),
+            "n_clusters": int(cluster_ids.max()) + 1 if cluster_ids.size > 0 else 0,
+            "cluster_sizes": cluster_sizes,
+            "sample_to_cluster": sample_to_cluster,
+            "cluster_to_samples": cluster_to_samples,
+        }
+
+        out_path = os.path.join(save_dir, f"cluster_assignments_{tag}.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+
+        # Also update a "latest" pointer so analysis scripts always find the
+        # most recent assignment without knowing the step number.
+        latest_path = os.path.join(save_dir, "cluster_assignments_latest.json")
+        with open(latest_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+
+        _print_rank0(
+            f"Cluster assignments saved: {out_path} "
+            f"(N={payload['n_samples']}, K={payload['n_clusters']})",
+            self.rank,
+        )
+
+    def _log_cluster_weights(
+        self,
+        global_step: int,
+        grad_gamma: torch.Tensor,
+        grad_gamma_delta: Optional[torch.Tensor] = None,
+        event: str = "pmp_update",
+    ):
+        """
+        Append one record per PMP update to cluster_weight_history.jsonl.
+
+        The file is JSON-lines so it can be streamed without loading the whole
+        history. Each record captures everything needed to reconstruct w_k(t):
+            {
+              "step":       <int, global optimizer step>,
+              "event":      "pmp_update" | "recluster",
+              "n_clusters": K,
+              "weights":          [w_0, ..., w_{K-1}],   # current sampler weights
+              "grad_gamma":       [g_0, ..., g_{K-1}],   # accumulated
+              "grad_gamma_delta": [d_0, ..., d_{K-1}] | null,  # this update's delta
+              "dead_clusters":    [bool, ...],           # True = permanently dropped
+              "stats": {min, max, entropy, alive, dropped}
+            }
+
+        Cluster id k in `weights[k]` corresponds to cluster id k in the most
+        recent cluster_assignments_*.json. After a "recluster" event the cluster
+        ids are re-indexed, and analysis code should switch to the new
+        cluster_assignments_step{N}.json.
+        """
+        if self.rank != 0:
+            return
+
+        save_dir = self.cfg.training.save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        log_path = os.path.join(save_dir, "cluster_weight_history.jsonl")
+
+        gg = grad_gamma.detach().cpu().float()
+        w = self.sampler.weights.detach().cpu().float()
+        dead = self.sampler._dead_clusters.detach().cpu().tolist()
+
+        w_pos = w[w > 0]
+        entropy = float((-w_pos * w_pos.log()).sum().item()) if w_pos.numel() > 0 else 0.0
+
+        record = {
+            "step": int(global_step),
+            "event": event,
+            "n_clusters": int(w.shape[0]),
+            "weights": w.tolist(),
+            "grad_gamma": gg.tolist(),
+            "grad_gamma_delta": (
+                grad_gamma_delta.detach().cpu().float().tolist()
+                if grad_gamma_delta is not None else None
+            ),
+            "dead_clusters": [bool(d) for d in dead],
+            "stats": {
+                "weight_min": float(w.min().item()),
+                "weight_max": float(w.max().item()),
+                "weight_entropy": entropy,
+                "alive": int(self.sampler.n_alive),
+                "dropped": int(self.sampler.n_dropped),
+                "grad_gamma_min": float(gg.min().item()),
+                "grad_gamma_max": float(gg.max().item()),
+                "grad_gamma_norm": float(gg.norm().item()),
+            },
+        }
+
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # ------------------------------------------------------------------
     # Clustering (shared by __init__ and _recluster)
@@ -1206,6 +1377,14 @@ class IntegratedClusterTrainer:
         self.train_dataset.update_cluster_ids(cluster_ids)
         n_clusters_new = self.train_dataset.n_clusters
 
+        # ---- Persist the new sample_id → cluster_id mapping ----
+        if self.rank == 0:
+            self._save_cluster_assignments(
+                cluster_ids=cluster_ids,
+                step=global_step,
+                tag=f"recluster_step{global_step}",
+            )
+
         if n_clusters_new != self.n_clusters:
             # Resize grad_gamma if cluster count changed
             self.grad_gamma = torch.zeros(n_clusters_new, dtype=torch.float32)
@@ -1224,6 +1403,15 @@ class IntegratedClusterTrainer:
             drop_patience=int(getattr(cfg.pmp, "drop_patience", 5)),
         )
         _print_rank0(f"[Recluster] done: {n_clusters_new} clusters", self.rank)
+
+        # Record a recluster marker in the weight history so downstream analysis
+        # knows that cluster ids are no longer comparable across this boundary.
+        self._log_cluster_weights(
+            global_step=global_step,
+            grad_gamma=self.grad_gamma,
+            grad_gamma_delta=None,
+            event="recluster",
+        )
 
     # ------------------------------------------------------------------
     # Evaluation

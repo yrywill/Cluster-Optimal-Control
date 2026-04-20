@@ -100,41 +100,60 @@ def compute_cluster_contributions_sketch(
 
         return s  # s is a plain tensor, no graph attached
 
+    # Current rank for sharding (used both in dev and cluster loop)
+    if distributed and dist.is_initialized():
+        rank = dist.get_rank()
+    else:
+        rank = 0
+
     # ==================================================================
     # Step 1: Sketch dev gradient  q = sketch(∇L_dev)
+    # Each rank processes a shard of dev_batches; all_reduce at end.
     # ==================================================================
     q = torch.zeros(sketcher.m, device=device, dtype=torch.float32)
-    n_dev = 0
+    n_dev_local = 0
+    total_dev = len(dev_batches)
 
-    for model_batch, no_model_batch in dev_batches:
+    for i, (model_batch, no_model_batch) in enumerate(dev_batches):
+        if distributed and (i % world_size) != rank:
+            continue
         q += _sketch_loss(
             inner_model,
             model_batch["input_ids"], model_batch["attention_mask"],
             no_model_batch["label"], no_model_batch["loss_mask"],
         )
-        n_dev += 1
-
-    # Free dev forward cache before cluster loop
-    torch.cuda.empty_cache()
-
-    if n_dev > 1:
-        q = q / n_dev
+        n_dev_local += 1
 
     if distributed:
         dist.all_reduce(q, op=dist.ReduceOp.SUM)
-        q = q / world_size
 
-    logger.info(f"[Sketch] dev sketch done: norm={q.norm():.4f}, n_dev_batches={n_dev}")
+    if total_dev > 1:
+        q = q / max(total_dev, 1)
+
+    logger.info(
+        f"[Sketch] dev sketch done: norm={q.norm():.4f}, "
+        f"n_dev_total={total_dev}, n_dev_local(rank{rank})={n_dev_local}"
+    )
 
     # ==================================================================
     # Step 2: Per-cluster sketch from random samples
+    # Each rank owns a shard of clusters: my_ids = ids[rank::world_size].
+    # Final all_reduce(SUM) combines partial results (no double counting
+    # because each k is only computed on one rank).
     # ==================================================================
     grad_gamma_delta = torch.zeros(n_clusters, device=device, dtype=torch.float32)
 
     if cluster_ids_to_eval is None:
         cluster_ids_to_eval = list(range(n_clusters))
 
-    for k in cluster_ids_to_eval:
+    # Rank-sharded cluster iteration
+    if distributed:
+        my_cluster_ids = cluster_ids_to_eval[rank::world_size]
+    else:
+        my_cluster_ids = cluster_ids_to_eval
+
+    n_local = 0
+    for k in my_cluster_ids:
         # Get cluster sample indices
         cluster_indices = train_dataset.get_cluster_indices(k)
         if len(cluster_indices) == 0:
@@ -158,16 +177,14 @@ def compute_cluster_contributions_sketch(
             no_model_batch["label"], no_model_batch["loss_mask"],
         )
 
-        # Free intermediate tensors to prevent memory buildup over 222 clusters
-        del model_batch, no_model_batch, samples, collated
-        torch.cuda.empty_cache()
-
-        if distributed:
-            dist.all_reduce(v_k, op=dist.ReduceOp.SUM)
-            v_k = v_k / world_size
-
         ct_k = torch.dot(q, v_k)
         grad_gamma_delta[k] = grad_gamma_delta[k] + pmp_lr * ct_k
+        n_local += 1
+
+    # Combine per-rank contributions (each cluster k is computed on exactly
+    # one rank, so SUM reconstructs the full grad_gamma_delta).
+    if distributed:
+        dist.all_reduce(grad_gamma_delta, op=dist.ReduceOp.SUM)
 
     if was_training:
         model.train()
@@ -175,7 +192,8 @@ def compute_cluster_contributions_sketch(
     n_evaluated = sum(1 for k in cluster_ids_to_eval
                       if len(train_dataset.get_cluster_indices(k)) > 0)
     logger.info(
-        f"[Sketch] PMP done: clusters_evaluated={n_evaluated}, "
+        f"[Sketch] PMP done: clusters_total={n_evaluated}, "
+        f"local(rank{rank})={n_local}, "
         f"grad_gamma_delta norm={grad_gamma_delta.norm():.4f}"
     )
     return grad_gamma_delta

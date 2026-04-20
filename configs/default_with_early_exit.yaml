@@ -56,8 +56,8 @@ projection:
   seed: 42                      # random seed for reproducible projection matrix
 
 pmp:
-  window_size: 20               # number of recent training steps kept in ring buffer
-  update_interval: 100          # update cluster weights every N gradient steps
+  window_size: 1                # number of recent training steps kept in ring buffer
+  update_interval: 50           # update cluster weights every N gradient steps
   lr: 0.008                     # lr factor used inside PMP backward
   temperature: 1.0              # softmax temperature
   min_weight: 0.01              # minimum weight floor per cluster
@@ -96,8 +96,8 @@ training:
   adam_eps: 1.0e-6
   seed: 42
   log_interval: 10              # log every N gradient steps
-  eval_interval: 500            # evaluate on dev set every N gradient steps
-  save_interval: 1000           # save checkpoint every N gradient steps
+  eval_interval: 100            # evaluate on dev set every N gradient steps
+  save_interval: 100            # save checkpoint every N gradient steps
   save_dir: "outputs/run"       # output directory (checkpoints + logs)
   no_eval_at_start: false       # skip evaluation before training starts
   fp32: false                   # force full fp32 training (overrides model.dtype)
